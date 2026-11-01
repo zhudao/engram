@@ -2427,13 +2427,19 @@ func (s *Store) RepairPendingSessionDirectories(project string, apply bool) ([]S
 				if decodeSyncPayload([]byte(mutation.Payload), &body) != nil || strings.TrimSpace(body.Directory) != "" || strings.TrimSpace(body.ID) == "" || body.ID != mutation.EntityKey {
 					continue
 				}
-				var localProject string
-				err := tx.QueryRow(`SELECT project FROM sessions WHERE id = ?`, body.ID).Scan(&localProject)
+				if strings.TrimSpace(body.OwnershipMode) == SessionOwnershipProjectOwned {
+					continue
+				}
+				var localProject, localMode string
+				err := tx.QueryRow(`SELECT project, ifnull(ownership_mode, '') FROM sessions WHERE id = ?`, body.ID).Scan(&localProject, &localMode)
 				if errors.Is(err, sql.ErrNoRows) {
 					continue
 				}
 				if err != nil {
 					return err
+				}
+				if strings.TrimSpace(localMode) == SessionOwnershipProjectOwned {
+					continue
 				}
 				normalizedLocalProject, _ := NormalizeProject(localProject)
 				normalizedMutationProject, _ := NormalizeProject(mutation.Project)
@@ -2688,8 +2694,30 @@ func (s *Store) evaluateCloudUpgradeLegacyMutationTx(tx *sql.Tx, mutation SyncMu
 				return blocked(UpgradeReasonBlockedLegacyMutationManual, "session payload directory conflicts with local session directory"), nil
 			}
 		}
+		if op == SyncOpUpsert && body.OwnershipMode == "" {
+			var fields map[string]json.RawMessage
+			if err := decodeSyncPayload([]byte(payload), &fields); err != nil {
+				return cloudUpgradeLegacyMutationEvaluation{}, err
+			}
+			if _, explicit := fields["ownership_mode"]; !explicit {
+				var dbMode, dbProject string
+				err := tx.QueryRow(`SELECT ifnull(ownership_mode, ''), ifnull(project, '') FROM sessions WHERE id = ?`, body.ID).Scan(&dbMode, &dbProject)
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return cloudUpgradeLegacyMutationEvaluation{}, err
+				}
+				if dbMode == SessionOwnershipProjectOwned {
+					localProject, _ := NormalizeProject(dbProject)
+					if localProject != ownerProject || (body.Project != "" && body.Project != ownerProject) {
+						return blocked(UpgradeReasonBlockedLegacyMutationManual, "session payload project conflicts with local session project"), nil
+					}
+					body.OwnershipMode = dbMode
+					changed = true
+				}
+			}
+		}
 		if op == SyncOpUpsert && body.OwnershipMode == SessionOwnershipProjectOwned {
-			if err := ValidateCloudSessionDirectory([]byte(payload)); err != nil {
+			// Validate the raw directory so inferred ownership cannot turn null into blank.
+			if err := validatePulledSessionDirectoryLocal([]byte(payload)); err != nil {
 				return blocked(UpgradeReasonBlockedLegacyMutationManual, err.Error()), nil
 			}
 		}
@@ -3702,7 +3730,7 @@ func (s *Store) startSessionRegistration(id, project, directory, mode string, re
 			if err := tx.QueryRow(`SELECT ifnull(directory, '') FROM sessions WHERE id = ?`, id).Scan(&existingDirectory); err != nil {
 				return err
 			}
-			identityRepaired = existingProject == "" || existingMode == "" || strings.TrimSpace(existingDirectory) == ""
+			identityRepaired = existingProject == "" || existingMode == "" || (existingMode != SessionOwnershipProjectOwned && strings.TrimSpace(existingDirectory) == "") || (strings.TrimSpace(existingDirectory) == "" && strings.TrimSpace(directory) != "")
 		}
 		// Never rewrite or skip an already-selected continuation. Resolve/end
 		// still reject any existing scope mismatch rather than repairing data.
@@ -7491,13 +7519,30 @@ func (s *Store) ListPendingSyncMutationsAfterSeq(targetKey string, afterSeq int6
 // the existing legacy validator proves cannot be repaired from local state.
 // It never acknowledges, rewrites, or deletes a mutation.
 func (s *Store) QuarantineIrreparableSyncMutations(targetKey, project string, apply bool) (SyncMutationQuarantineReport, error) {
+	report, _, err := s.quarantineIrreparableSyncMutations(targetKey, project, apply, 0, 0)
+	return report, err
+}
+
+// QuarantineIrreparableSyncMutationsPage bounds automatic validation to at most
+// 100 rows per transaction. nextSeq is zero when this scan reached its end.
+// Manual/doctor callers retain the complete operation above.
+func (s *Store) QuarantineIrreparableSyncMutationsPage(targetKey string, afterSeq int64, limit int) (SyncMutationQuarantineReport, int64, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+	return s.quarantineIrreparableSyncMutations(targetKey, "", true, afterSeq, limit)
+}
+
+func (s *Store) quarantineIrreparableSyncMutations(targetKey, project string, apply bool, afterSeq int64, limit int) (SyncMutationQuarantineReport, int64, error) {
 	targetKey = normalizeSyncTargetKey(targetKey)
 	project, _ = NormalizeProject(project)
 	project = strings.TrimSpace(project)
 	report := SyncMutationQuarantineReport{Project: project, Applied: apply, Actions: []SyncMutationQuarantineAction{}}
 	if isSyncInboxTarget(targetKey) {
-		return report, nil
+		return report, 0, nil
 	}
+	var nextSeq int64
+	var scanned int
 	runTx := s.withTx
 	if !apply {
 		runTx = s.withReadTx
@@ -7508,11 +7553,19 @@ func (s *Store) QuarantineIrreparableSyncMutations(targetKey, project string, ap
 		query := `SELECT seq, target_key, entity, entity_key, op, payload, source, project, occurred_at, acked_at
 			FROM sync_mutations WHERE target_key = ? AND acked_at IS NULL AND disposition = 'pending'`
 		args := []any{targetKey}
+		if limit > 0 {
+			query += ` AND seq > ?`
+			args = append(args, afterSeq)
+		}
 		if project != "" {
 			query += ` AND project = ?`
 			args = append(args, project)
 		}
 		query += ` ORDER BY seq ASC`
+		if limit > 0 {
+			query += ` LIMIT ?`
+			args = append(args, limit)
+		}
 		rows, err := s.queryItHook(tx, query, args...)
 		if err != nil {
 			return err
@@ -7523,6 +7576,8 @@ func (s *Store) QuarantineIrreparableSyncMutations(targetKey, project string, ap
 			if err := rows.Scan(&mutation.Seq, &mutation.TargetKey, &mutation.Entity, &mutation.EntityKey, &mutation.Op, &mutation.Payload, &mutation.Source, &mutation.Project, &mutation.OccurredAt, &mutation.AckedAt); err != nil {
 				return err
 			}
+			nextSeq = mutation.Seq
+			scanned++
 			evaluation, err := s.evaluateCloudUpgradeLegacyMutationTx(tx, mutation)
 			if err != nil {
 				return err
@@ -7578,9 +7633,12 @@ func (s *Store) QuarantineIrreparableSyncMutations(targetKey, project string, ap
 		return nil
 	})
 	if err != nil {
-		return SyncMutationQuarantineReport{}, fmt.Errorf("quarantine irreparable sync mutations: %w", err)
+		return SyncMutationQuarantineReport{}, 0, fmt.Errorf("quarantine irreparable sync mutations: %w", err)
 	}
-	return report, nil
+	if scanned < limit || limit == 0 {
+		nextSeq = 0
+	}
+	return report, nextSeq, nil
 }
 
 // SupersedeUnenrolledLegacyMutations retires pending local upserts only when
@@ -10490,7 +10548,8 @@ func syncDeleteTombstoneNeedsBackfill(alias string) string {
 	// backfill work.
 	return fmt.Sprintf(`%[1]s.active = 1 AND %[1]s.entity IN ('observation', 'session') AND %[1]s.last_remote_mutation_seq IS NULL AND NOT EXISTS (
 		SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = %[1]s.entity
-		AND sm.entity_key = %[1]s.entity_key AND sm.op = ? AND sm.source = ? AND sm.acked_at IS NULL AND sm.disposition IN ('pending', 'quarantined')
+		AND sm.entity_key = %[1]s.entity_key AND sm.op = ? AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined')
+		AND sm.seq > %[1]s.last_mutation_seq
 	)`, alias)
 }
 
@@ -10832,11 +10891,12 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 			q: `SELECT COUNT(*) FROM sessions
 			    WHERE project = ?
 			      AND ` + sqlSessionIDNotBlank("id") + `
+			      AND (trim(sessions.directory, ?) != '' OR sessions.ownership_mode = 'project_owned')
 			      AND NOT EXISTS (
 			        SELECT 1 FROM sync_mutations sm
 			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = sessions.id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined')
 			      )`,
-			args: []any{project, sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal},
+			args: []any{project, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal},
 		},
 		{
 			q: `SELECT COUNT(*) FROM observations o
@@ -10934,6 +10994,7 @@ func (s *Store) enrolledProjectsNeedingBackfill() ([]string, error) {
 			SELECT x.project
 			FROM sessions x
 			WHERE trim(x.id, ?) != ''
+			  AND (trim(x.directory, ?) != '' OR x.ownership_mode = 'project_owned')
 			  AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = x.id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined'))
 			UNION
 			SELECT coalesce(nullif(x.project, ''), ifnull(xs.project, ''))
@@ -10969,7 +11030,7 @@ func (s *Store) enrolledProjectsNeedingBackfill() ([]string, error) {
 			  AND NOT EXISTS (SELECT 1 FROM sync_mutations sm WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = r.sync_id AND sm.source = ? AND sm.disposition IN ('pending', 'quarantined'))
 		) candidates ON candidates.project = ep.project
 		ORDER BY ep.project ASC`,
-		sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal,
+		sqlWhitespaceTrimSet, sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, SyncSourceLocal,
 		DefaultSyncTargetKey, SyncEntityObservation, SyncSourceLocal,
 		DefaultSyncTargetKey, SyncEntityObservation, SyncOpDelete, SyncSourceLocal,
 		DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal,
@@ -11067,6 +11128,7 @@ func (s *Store) backfillSessionSyncMutationsBatchTx(tx *sql.Tx, project string, 
 		FROM sessions
 		WHERE project = ?
 		  AND `+sqlSessionIDNotBlank("id")+`
+		  AND (trim(sessions.directory, ?) != '' OR sessions.ownership_mode = 'project_owned')
 		  AND NOT EXISTS (
 			SELECT 1
 			FROM sync_mutations sm
@@ -11077,7 +11139,7 @@ func (s *Store) backfillSessionSyncMutationsBatchTx(tx *sql.Tx, project string, 
 			  AND sm.disposition IN ('pending', 'quarantined')
 		  )
 		`+batch.page("sessions", "id", " ORDER BY started_at ASC, id ASC"),
-		append([]any{project, sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, mutationSource}, batch.args("sessions")...)...,
+		append([]any{project, sqlWhitespaceTrimSet, sqlWhitespaceTrimSet, DefaultSyncTargetKey, SyncEntitySession, mutationSource}, batch.args("sessions")...)...,
 	)
 	if err != nil {
 		return err
@@ -11524,7 +11586,7 @@ func (s *Store) enqueueSyncMutationWithSourceTx(tx *sql.Tx, entity, entityKey, o
 		source = SyncSourceLocal
 	}
 	if source == SyncSourceLocal && entity == SyncEntitySession && op == SyncOpUpsert {
-		if session, ok := payload.(syncSessionPayload); ok && strings.TrimSpace(session.Directory) == "" {
+		if session, ok := payload.(syncSessionPayload); ok && strings.TrimSpace(session.Directory) == "" && session.OwnershipMode != SessionOwnershipProjectOwned {
 			return nil
 		}
 	}
@@ -13872,10 +13934,10 @@ func (s *Store) PassiveCapture(p PassiveCaptureParams) (*PassiveCaptureResult, e
 			continue
 		}
 
-		// Truncate for title: first 60 chars
+		// Keep the 60-byte title prefix on a complete UTF-8 boundary.
 		title := learning
 		if len(title) > 60 {
-			title = title[:60] + "..."
+			title = truncateUTF8Prefix(title, 60) + "..."
 		}
 
 		_, err = s.AddObservation(AddObservationParams{

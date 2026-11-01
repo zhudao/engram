@@ -607,6 +607,22 @@ func codexFixtureProject(t *testing.T, cwd, project string) {
 	}
 }
 
+func codexHandoffToolGuard() string {
+	// MSYS pays for each command-substitution fork. Collect all lookups in one
+	// subprocess while retaining the exact type/path pair for every tool.
+	return `resolved=$(for name in engram curl cat dirname jq date touch bash; do
+  type -t "$name" && command -v "$name" || exit 92
+done) || exit 92
+expected=
+for name in engram curl cat dirname jq date touch bash; do
+  expected="${expected}file
+$bin/$name
+"
+done
+[ "$resolved" = "${expected%$'\n'}" ] || exit 92
+`
+}
+
 func codexHandoffEnv(t *testing.T, cwd, serverURL string, binary ...string) []string {
 	t.Helper()
 	target, err := url.Parse(strings.TrimSpace(serverURL))
@@ -704,13 +720,16 @@ bin=$(convert "$bin") || exit 91
 cd "$root" || exit 91
 export PATH="$bin"
 hash -r
-for name in engram curl cat dirname jq date touch bash; do
-  [ "$(type -t "$name")" = file ] && [ "$(command -v "$name")" = "$bin/$name" ] || exit 92
-done
+` + codexHandoffToolGuard() + `
 if command -v engram.exe >/dev/null || command -v curl.exe >/dev/null; then
   exit 93
 fi
 `
+	if f.cygpath != "" {
+		// Runtime initialization used the parent-lived native temp. Only after
+		// all trusted startup checks restore private temps for hook children.
+		startup += "export TMP=\"$root/tmp\" TEMP=\"$root/tmp\"\n"
+	}
 	if err := os.WriteFile(gate, []byte(startup), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -732,7 +751,11 @@ fi
 			t.Fatal(err)
 		}
 		for _, key := range keys {
-			env = append(env, key+"="+filepath.Join(cwd, subdir))
+			value := filepath.Join(cwd, subdir)
+			if key == "TMP" || key == "TEMP" {
+				value = codexBashStartupTemp(value)
+			}
+			env = append(env, key+"="+value)
 		}
 	}
 	if f.cygpath != "" {
